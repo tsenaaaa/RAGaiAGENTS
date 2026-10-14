@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -8,292 +8,585 @@ interface Message {
   role: "user" | "assistant";
   content: string;
   fileName?: string;
-  filePreview?: string;
+}
+
+interface Conversation {
+  id: string;
+  title: string;
+  updatedAt: number;
+  messages: Message[];
+}
+
+const STORAGE_KEY = "smartops.conversations.v1";
+const NEW_CHAT_TITLE = "Percakapan baru";
+
+function createConversation(): Conversation {
+  return {
+    id: crypto.randomUUID(),
+    title: NEW_CHAT_TITLE,
+    updatedAt: Date.now(),
+    messages: [],
+  };
+}
+
+function getConversationTitle(text: string, fileName?: string) {
+  const title = text.trim() || fileName || NEW_CHAT_TITLE;
+  return title.length > 34 ? `${title.slice(0, 34)}…` : title;
+}
+
+function getFileIcon(name: string) {
+  if (/\.(jpg|jpeg|png|gif|webp)$/i.test(name)) return "🖼️";
+  if (/\.pdf$/i.test(name)) return "📄";
+  return "📎";
 }
 
 export default function ChatInterface() {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeId, setActiveId] = useState("");
   const [input, setInput] = useState("");
   const [file, setFile] = useState<File | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loadingChatId, setLoadingChatId] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [mobileHistoryOpen, setMobileHistoryOpen] = useState(false);
+  const [readyConversationId, setReadyConversationId] = useState<string | null>(null);
+  const [hydrated, setHydrated] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const chatEndRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const shouldStickToBottom = useRef(true);
+  const forceScroll = useRef(false);
+  const scrollFrame = useRef<number | null>(null);
+  const pendingPromptScroll = useRef(false);
+  const holdAtPrompt = useRef(false);
 
-  const scrollToBottom = () => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
+  const scrollToPositionSmoothly = useCallback((requestedTop: number) => {
+    const container = messagesRef.current;
+    if (!container) return;
+    if (scrollFrame.current !== null) cancelAnimationFrame(scrollFrame.current);
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0];
-    if (!selected) return;
+    const start = container.scrollTop;
+    const target = Math.max(0, Math.min(requestedTop, container.scrollHeight - container.clientHeight));
+    const distance = target - start;
+    if (distance <= 1) return;
 
-    setFile(selected);
+    const duration = Math.min(900, Math.max(420, distance * 0.45));
+    const startedAt = performance.now();
+    const animate = (now: number) => {
+      const progress = Math.min((now - startedAt) / duration, 1);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      container.scrollTop = start + distance * eased;
+      if (progress < 1) scrollFrame.current = requestAnimationFrame(animate);
+      else scrollFrame.current = null;
+    };
+    scrollFrame.current = requestAnimationFrame(animate);
+  }, []);
 
-    if (selected.type.startsWith("image/")) {
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        setFile((prev) => {
-          if (prev && prev.name === selected.name) {
-            return Object.assign(prev, { preview: ev.target?.result as string });
-          }
-          return prev;
-        });
-      };
-      reader.readAsDataURL(selected);
+  const scrollToBottomSmoothly = useCallback(() => {
+    const container = messagesRef.current;
+    if (container) {
+      scrollToPositionSmoothly(container.scrollHeight - container.clientHeight);
     }
+  }, [scrollToPositionSmoothly]);
+
+  useEffect(() => {
+    let saved: Conversation[] = [];
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(parsed)) {
+        saved = parsed.filter(
+          (item): item is Conversation =>
+            typeof item?.id === "string" &&
+            typeof item?.title === "string" &&
+            Array.isArray(item?.messages),
+        );
+      }
+    } catch {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+
+    const initial = saved.length ? saved : [createConversation()];
+    setConversations(initial);
+    setActiveId(initial[0].id);
+    setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
+    } catch {
+      // Keep the current chat usable if browser storage is unavailable or full.
+    }
+  }, [conversations, hydrated]);
+
+  const activeConversation =
+    conversations.find((conversation) => conversation.id === activeId) ??
+    conversations[0];
+  const messages = activeConversation?.messages ?? [];
+  const visibleConversations = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    const sorted = [...conversations].sort((a, b) => b.updatedAt - a.updatedAt);
+    if (!query) return sorted;
+    return sorted.filter((conversation) =>
+      conversation.title.toLowerCase().includes(query),
+    );
+  }, [conversations, search]);
+
+  useEffect(() => {
+    const container = messagesRef.current;
+    if (!container) return;
+    if (pendingPromptScroll.current) {
+      pendingPromptScroll.current = false;
+      const lastMessage = container.querySelector<HTMLElement>(
+        `[data-message-index="${messages.length - 1}"]`,
+      );
+      if (lastMessage) {
+        const target = container.scrollTop + lastMessage.getBoundingClientRect().top - container.getBoundingClientRect().top - 20;
+        scrollToPositionSmoothly(target);
+      }
+      return;
+    }
+    if (holdAtPrompt.current) return;
+    if (forceScroll.current || shouldStickToBottom.current) {
+      scrollToBottomSmoothly();
+    }
+    forceScroll.current = false;
+  }, [activeId, messages.length, loadingChatId, scrollToBottomSmoothly, scrollToPositionSmoothly]);
+
+  const updateConversation = (
+    conversationId: string,
+    update: (conversation: Conversation) => Conversation,
+  ) => {
+    setConversations((current) =>
+      current.map((conversation) =>
+        conversation.id === conversationId ? update(conversation) : conversation,
+      ),
+    );
   };
 
-  const removeFile = () => {
+  const startNewChat = () => {
+    const conversation = createConversation();
+    setConversations((current) => [conversation, ...current]);
+    setActiveId(conversation.id);
+    setInput("");
     setFile(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
+    setMobileHistoryOpen(false);
+    shouldStickToBottom.current = true;
+    holdAtPrompt.current = false;
+    setReadyConversationId(null);
+    forceScroll.current = true;
   };
 
-  const handleSend = async () => {
-    if (!input.trim() && !file) return;
-
-    const userMsg: Message = {
-      role: "user",
-      content: input,
-      fileName: file?.name,
-      filePreview: file?.type.startsWith("image/")
-        ? URL.createObjectURL(file)
-        : undefined,
-    };
-
-    setMessages((prev) => [...prev, userMsg]);
+  const selectConversation = (conversationId: string) => {
+    setActiveId(conversationId);
     setInput("");
-    setLoading(true);
-    scrollToBottom();
+    setFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    setMobileHistoryOpen(false);
+    shouldStickToBottom.current = true;
+    holdAtPrompt.current = false;
+    setReadyConversationId(null);
+    forceScroll.current = true;
+  };
+
+  const deleteConversation = (conversationId: string) => {
+    const conversation = conversations.find((item) => item.id === conversationId);
+    if (!conversation) return;
+    if (!window.confirm(`Hapus “${conversation.title}”?`)) return;
+
+    const remaining = conversations.filter((item) => item.id !== conversationId);
+    if (remaining.length === 0) {
+      const fresh = createConversation();
+      setConversations([fresh]);
+      setActiveId(fresh.id);
+    } else {
+      setConversations(remaining);
+      if (activeId === conversationId) setActiveId(remaining[0].id);
+    }
+  };
+
+  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = event.target.files?.[0];
+    if (selected) setFile(selected);
+  };
+
+  const handleSend = async (suggestedText?: string) => {
+    if (!activeConversation || loadingChatId) return;
+    const messageText = suggestedText?.trim() || input.trim();
+    if (!messageText && !file) return;
+
+    const conversationId = activeConversation.id;
+    const finalMessageText = messageText || "Jelaskan isi file ini.";
+    const selectedFile = file;
+    const userMessage: Message = {
+      role: "user",
+      content: finalMessageText,
+      fileName: selectedFile?.name,
+    };
+    const priorMessages = activeConversation.messages;
+    const nextMessages = [...priorMessages, userMessage];
+
+    updateConversation(conversationId, (conversation) => ({
+      ...conversation,
+      title:
+        conversation.messages.length === 0
+          ? getConversationTitle(finalMessageText, selectedFile?.name)
+          : conversation.title,
+      updatedAt: Date.now(),
+      messages: nextMessages,
+    }));
+    setInput("");
+    setFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    setLoadingChatId(conversationId);
+    holdAtPrompt.current = true;
+    pendingPromptScroll.current = true;
+    setReadyConversationId(null);
 
     try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, "");
+      if (!apiUrl) throw new Error("NEXT_PUBLIC_API_URL belum diatur.");
+
       const formData = new FormData();
-      formData.append("message", input || "Jelaskan isi file ini.");
-      if (file) formData.append("file", file);
-
-      const res = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL}/chat`,
-        { method: "POST", body: formData }
+      formData.append("message", finalMessageText);
+      formData.append(
+        "history",
+        JSON.stringify(
+          priorMessages.map(({ role, content }) => ({ role, content })),
+        ),
       );
+      if (selectedFile) formData.append("file", selectedFile);
 
-      const data = await res.json();
+      const response = await fetch(`${apiUrl}/chat`, {
+        method: "POST",
+        body: formData,
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.detail || `Server merespons ${response.status}.`);
+      }
+      if (typeof data.reply !== "string") {
+        throw new Error("Server tidak mengirim balasan yang bisa dibaca.");
+      }
 
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: data.reply },
-      ]);
-    } catch {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: "⚠️ Gagal terhubung ke server." },
-      ]);
+      updateConversation(conversationId, (conversation) => ({
+        ...conversation,
+        updatedAt: Date.now(),
+        messages: [...conversation.messages, { role: "assistant", content: data.reply }],
+      }));
+      setReadyConversationId(conversationId);
+    } catch (error) {
+      const detail =
+        error instanceof Error ? error.message : "Terjadi kesalahan yang tidak diketahui.";
+      updateConversation(conversationId, (conversation) => ({
+        ...conversation,
+        updatedAt: Date.now(),
+        messages: [
+          ...conversation.messages,
+          {
+            role: "assistant",
+            content: `Maaf, pesan gagal diproses. ${detail}`,
+          },
+        ],
+      }));
+      setReadyConversationId(conversationId);
     } finally {
-      setLoading(false);
-      setFile(null);
-      if (fileInputRef.current) fileInputRef.current.value = "";
-      scrollToBottom();
+      setLoadingChatId(null);
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void handleSend();
     }
-  };
-
-  const getFileIcon = (name: string) => {
-    if (/\.(jpg|jpeg|png|gif|webp)$/i.test(name)) return "🖼️";
-    if (/\.pdf$/i.test(name)) return "📄";
-    return "📎";
   };
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      {/* Messages */}
-      <div className="min-h-0 flex-1 overscroll-contain overflow-y-auto px-4 py-6 space-y-6">
-        {messages.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full text-gray-500 gap-6">
-            <div className="relative">
-              <div className="absolute inset-0 bg-gradient-glow animate-pulse opacity-50 rounded-full blur-xl scale-150"></div>
-              <div className="relative w-20 h-20 rounded-3xl bg-white border border-ice-dark shadow-[0_10px_40px_-10px_rgba(114,196,238,0.3)] flex items-center justify-center text-soft-dark rotate-3">
-                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
-                </svg>
-              </div>
-            </div>
-            <div className="text-center">
-              <p className="text-lg font-medium text-gray-700">How can I assist you today?</p>
-              <p className="text-sm text-gray-400 mt-1">Upload a file or type a message to begin.</p>
-            </div>
-          </div>
-        )}
-
-        {messages.map((msg, i) => (
-          <div
-            key={i}
-            className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-          >
-            <div
-              className={`max-w-[92%] sm:max-w-[85%] rounded-3xl px-5 py-4 sm:px-7 sm:py-5 shadow-sm ${
-                msg.role === "user"
-                  ? "bg-gradient-iconic text-white rounded-br-sm"
-                  : "bg-white border border-ice-dark text-gray-800 rounded-bl-sm"
-              }`}
-            >
-              {/* File attachment preview in user message */}
-              {msg.filePreview && (
-                <img
-                  src={msg.filePreview}
-                  alt="attachment"
-                  className="rounded-xl mb-3 max-h-48 border border-white/20 shadow-sm"
-                />
-              )}
-              {msg.fileName && !msg.filePreview && (
-                <div className={`flex items-center gap-2 text-sm mb-3 rounded-xl px-3 py-2 border w-fit ${msg.role === 'user' ? 'bg-white/10 border-white/20 text-white' : 'bg-ice-light border-ice-dark text-soft-dark'}`}>
-                  <span className="text-lg">{getFileIcon(msg.fileName)}</span>
-                  <span className="truncate font-medium">{msg.fileName}</span>
-                </div>
-              )}
-
-              {/* Message content */}
-              {msg.role === "assistant" ? (
-                <div className="prose prose-slate max-w-none text-[15px] leading-relaxed 
-                  prose-p:leading-relaxed prose-p:mb-4 last:prose-p:mb-0
-                  prose-headings:font-semibold prose-headings:text-gray-800 prose-headings:mt-7 prose-headings:mb-4
-                  prose-h1:text-xl prose-h2:text-lg prose-h3:text-base
-                  prose-strong:font-semibold prose-strong:text-gray-900
-                  prose-ul:list-outside prose-ul:pl-5 prose-ul:my-4 prose-ul:list-disc
-                  prose-ol:list-outside prose-ol:pl-5 prose-ol:my-4 prose-ol:list-decimal
-                  prose-li:marker:text-soft-dark prose-li:pl-1 prose-li:my-1.5
-                  prose-pre:bg-ice-light prose-pre:border prose-pre:border-ice-dark prose-pre:text-gray-700 prose-pre:rounded-xl prose-pre:my-4
-                  prose-code:text-soft-dark prose-code:bg-ice-light/50 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:font-medium before:prose-code:content-none after:prose-code:content-none
-                  prose-table:border-collapse prose-table:w-full prose-table:my-6 prose-table:text-sm
-                  prose-tr:border-b prose-tr:border-ice-dark/50 last:prose-tr:border-0
-                  prose-td:py-3 prose-td:px-4 prose-td:align-top
-                  prose-th:py-3 prose-th:px-4 prose-th:text-left prose-th:bg-ice-light/30 prose-th:font-semibold prose-th:text-gray-700
-                  prose-a:text-soft-dark hover:prose-a:text-soft">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
-                </div>
-              ) : (
-                <p className="text-[15px] leading-relaxed whitespace-pre-wrap">{msg.content}</p>
-              )}
-            </div>
-          </div>
-        ))}
-
-        {/* Loading indicator */}
-        {loading && (
-          <div className="flex justify-start">
-            <div className="bg-white border border-ice-dark rounded-3xl rounded-bl-sm px-5 py-4 shadow-sm flex items-center gap-2">
-              <div className="loading-dot w-2 h-2 rounded-full bg-soft" />
-              <div className="loading-dot w-2 h-2 rounded-full bg-soft" />
-              <div className="loading-dot w-2 h-2 rounded-full bg-soft" />
-            </div>
-          </div>
-        )}
-
-        <div ref={chatEndRef} />
-      </div>
-
-      {/* File preview bar */}
-      {file && (
-        <div className="px-6 pb-2">
-          <div className="inline-flex items-center gap-3 bg-white border border-ice-dark shadow-sm rounded-2xl px-4 py-2.5">
-            {file.type.startsWith("image/") ? (
-              <img
-                src={URL.createObjectURL(file)}
-                alt="preview"
-                className="w-12 h-12 rounded-xl object-cover border border-ice"
-              />
-            ) : (
-              <div className="w-12 h-12 rounded-xl bg-ice-light text-soft-dark flex items-center justify-center text-2xl border border-ice-dark">
-                {getFileIcon(file.name)}
-              </div>
-            )}
-            <div className="flex flex-col mr-2">
-              <span className="text-[13px] font-semibold text-gray-700 truncate max-w-[200px]">
-                {file.name}
-              </span>
-              <span className="text-[11px] font-medium text-gray-400">
-                {(file.size / 1024).toFixed(0)} KB
-              </span>
-            </div>
-            <button
-              onClick={removeFile}
-              className="w-7 h-7 rounded-full bg-gray-50 hover:bg-red-50 hover:text-red-500 flex items-center justify-center text-gray-400 transition-colors border border-gray-100"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-            </button>
-          </div>
-        </div>
+    <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-white/55">
+      {mobileHistoryOpen && (
+        <button
+          aria-label="Tutup riwayat chat"
+          className="fixed inset-0 z-30 bg-slate-900/25 lg:hidden"
+          onClick={() => setMobileHistoryOpen(false)}
+        />
       )}
 
-      {/* Input bar */}
-      <div className="shrink-0 px-6 pb-6 pt-2">
-        <div className="flex items-end gap-3 bg-white rounded-3xl border border-ice-dark shadow-[0_8px_30px_-10px_rgba(114,196,238,0.15)] px-4 py-3 focus-within:border-soft focus-within:shadow-[0_8px_30px_-10px_rgba(114,196,238,0.25)] transition-all duration-300">
-          {/* Attach button */}
+      <aside
+        className={`${
+          mobileHistoryOpen ? "fixed inset-y-0 left-0 z-40 flex" : "hidden"
+        } w-[min(84vw,310px)] shrink-0 flex-col border-r border-sky-100 bg-white/95 p-4 shadow-xl backdrop-blur-xl lg:relative lg:z-auto lg:flex lg:w-72 lg:shadow-none`}
+      >
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div>
+            <h2 className="font-semibold text-slate-800">Riwayat chat</h2>
+            <p className="mt-1 text-xs text-slate-400">Tersimpan di browser ini</p>
+          </div>
           <button
-            onClick={() => fileInputRef.current?.click()}
-            className="w-10 h-10 rounded-full bg-ice hover:bg-ice-dark flex items-center justify-center text-soft-dark transition-colors shrink-0 mb-0.5"
-            title="Upload file"
+            onClick={() => setMobileHistoryOpen(false)}
+            className="rounded-lg p-2 text-slate-400 hover:bg-slate-100 lg:hidden"
+            aria-label="Tutup riwayat"
           >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="20"
-              height="20"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
-            </svg>
-          </button>
-
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".jpg,.jpeg,.png,.gif,.webp,.pdf"
-            onChange={handleFileSelect}
-            className="hidden"
-          />
-
-          {/* Text input */}
-          <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Type your message here..."
-            rows={1}
-            className="flex-1 bg-transparent resize-none text-[15px] text-gray-800 placeholder-gray-400 outline-none py-2.5 max-h-32 mb-0.5"
-          />
-
-          {/* Send button */}
-          <button
-            onClick={handleSend}
-            disabled={loading || (!input.trim() && !file)}
-            className="w-10 h-10 rounded-full bg-gradient-iconic shadow-iconic disabled:opacity-50 disabled:shadow-none hover:scale-105 flex items-center justify-center text-white transition-all duration-300 shrink-0 mb-0.5"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              className="ml-0.5"
-            >
-              <line x1="22" y1="2" x2="11" y2="13" />
-              <polygon points="22 2 15 22 11 13 2 9 22 2" />
-            </svg>
+            ✕
           </button>
         </div>
-      </div>
+
+        <button
+          onClick={startNewChat}
+          className="mb-3 flex w-full items-center justify-center gap-2 rounded-xl bg-sky-500 px-4 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-600"
+        >
+          <span className="text-lg leading-none">＋</span> Chat baru
+        </button>
+
+        <label className="mb-3 block">
+          <span className="sr-only">Cari riwayat</span>
+          <input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Cari percakapan..."
+            className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-700 outline-none placeholder:text-slate-400 focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+          />
+        </label>
+
+        <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
+          {visibleConversations.length === 0 ? (
+            <p className="px-3 py-5 text-center text-sm text-slate-400">
+              Belum ada percakapan.
+            </p>
+          ) : (
+            visibleConversations.map((conversation) => (
+              <div
+                key={conversation.id}
+                className={`group flex items-center gap-1 rounded-xl border px-2 py-1.5 transition ${
+                  conversation.id === activeConversation?.id
+                    ? "border-sky-100 bg-sky-50"
+                    : "border-transparent hover:bg-slate-50"
+                }`}
+              >
+                <button
+                  onClick={() => selectConversation(conversation.id)}
+                  className="min-w-0 flex-1 px-1 py-2 text-left"
+                >
+                  <span className="block truncate text-sm font-medium text-slate-700">
+                    {conversation.title}
+                  </span>
+                  <span className="mt-1 block truncate text-xs text-slate-400">
+                    {conversation.messages.at(-1)?.content || "Belum ada pesan"}
+                  </span>
+                </button>
+                <button
+                  onClick={() => deleteConversation(conversation.id)}
+                  aria-label={`Hapus ${conversation.title}`}
+                  title="Hapus percakapan"
+                  className="rounded-lg px-2 py-1.5 text-slate-300 opacity-100 transition hover:bg-red-50 hover:text-red-500 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
+                >
+                  ×
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+
+        <p className="mt-3 border-t border-slate-100 px-1 pt-3 text-[11px] leading-relaxed text-slate-400">
+          Riwayat hanya tersimpan di browser dan perangkat ini.
+        </p>
+      </aside>
+
+      <section className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="flex shrink-0 items-center gap-3 border-b border-sky-100/70 px-4 py-2.5 lg:hidden">
+          <button
+            onClick={() => setMobileHistoryOpen(true)}
+            aria-label="Buka riwayat chat"
+            className="rounded-lg border border-sky-100 bg-white px-3 py-2 text-sm text-sky-700 shadow-sm"
+          >
+            ☰ Riwayat
+          </button>
+          <span className="min-w-0 truncate text-sm font-medium text-slate-600">
+            {activeConversation?.title ?? NEW_CHAT_TITLE}
+          </span>
+        </div>
+
+        <div
+          ref={messagesRef}
+          onScroll={(event) => {
+            const element = event.currentTarget;
+            shouldStickToBottom.current =
+              element.scrollHeight - element.scrollTop - element.clientHeight < 120;
+          }}
+          className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-6 sm:px-6"
+        >
+          <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col justify-end gap-6">
+            {messages.length === 0 && (
+              <div className="flex flex-1 flex-col items-center justify-center gap-6 py-12 text-center">
+                <div className="relative">
+                  <div className="absolute inset-0 scale-150 rounded-full bg-sky-100 opacity-60 blur-2xl" />
+                  <div className="relative flex h-20 w-20 items-center justify-center rounded-3xl border border-sky-100 bg-white text-sky-500 shadow-lg shadow-sky-100/60">
+                    <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M12 2 2 7l10 5 10-5-10-5ZM2 17l10 5 10-5M2 12l10 5 10-5" />
+                    </svg>
+                  </div>
+                </div>
+                <div>
+                  <p className="text-lg font-semibold text-slate-700">How can I assist you today?</p>
+                  <p className="mt-1 text-sm text-slate-400">Upload a file or type a message to begin.</p>
+                </div>
+              </div>
+            )}
+
+            {messages.map((message, index) => (
+              <div
+                key={`${activeConversation?.id}-${index}`}
+                data-message-index={index}
+                className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+              >
+                <div
+                  className={`max-w-[94%] rounded-3xl px-5 py-4 shadow-sm sm:max-w-[86%] sm:px-7 ${
+                    message.role === "user"
+                      ? "rounded-br-sm bg-gradient-to-br from-sky-500 to-blue-500 text-white"
+                      : "rounded-bl-sm border border-sky-100 bg-white text-slate-800"
+                  }`}
+                >
+                  {message.fileName && (
+                    <div className={`mb-3 flex w-fit items-center gap-2 rounded-xl border px-3 py-2 text-sm ${message.role === "user" ? "border-white/20 bg-white/10" : "border-sky-100 bg-sky-50 text-sky-800"}`}>
+                      <span className="text-lg">{getFileIcon(message.fileName)}</span>
+                      <span className="max-w-56 truncate font-medium">{message.fileName}</span>
+                    </div>
+                  )}
+                  {message.role === "assistant" ? (
+                    <div className="markdown-body break-words">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          input: ({ node, type, checked, ...props }) => {
+                            if (type !== "checkbox") return <input type={type} {...props} />;
+                            return (
+                              <input
+                                type="checkbox"
+                                checked={Boolean(checked)}
+                                readOnly
+                                onClick={(event) => {
+                                  event.preventDefault();
+                                  const listItem = event.currentTarget.closest("li");
+                                  const option = listItem?.textContent
+                                    ?.replace(/^\s*\[[ xX]\]\s*/, "")
+                                    .trim();
+                                  if (option) void handleSend(option);
+                                }}
+                                aria-label="Pilih topik ini dan kirim ke AI"
+                                title="Klik untuk membahas topik ini"
+                                className="mr-2 h-4 w-4 cursor-pointer accent-sky-500"
+                              />
+                            );
+                          },
+                        }}
+                      >
+                        {message.content}
+                      </ReactMarkdown>
+                    </div>
+                  ) : (
+                    <p className="whitespace-pre-wrap break-words text-[15px] leading-relaxed">
+                      {message.content}
+                    </p>
+                  )}
+                </div>
+              </div>
+            ))}
+
+            {loadingChatId === activeConversation?.id && (
+              <div className="flex justify-start">
+                <div className="flex items-center gap-2 rounded-3xl rounded-bl-sm border border-sky-100 bg-white px-5 py-4 shadow-sm">
+                  {[0, 1, 2].map((dot) => (
+                    <span key={dot} className="loading-dot h-2 w-2 rounded-full bg-sky-400" />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {readyConversationId === activeConversation?.id && holdAtPrompt.current && (
+          <button
+            onClick={() => {
+              holdAtPrompt.current = false;
+              setReadyConversationId(null);
+              shouldStickToBottom.current = true;
+              scrollToBottomSmoothly();
+            }}
+            className="absolute bottom-24 left-1/2 z-10 -translate-x-1/2 rounded-full border border-sky-200 bg-white/95 px-4 py-2 text-sm font-medium text-sky-700 shadow-lg shadow-sky-100 transition hover:bg-sky-50"
+          >
+            ✨ Jawaban AI sudah siap · lihat
+          </button>
+        )}
+
+        <div className="shrink-0 px-4 pb-4 pt-3 sm:px-6 sm:pb-6">
+          <div className="mx-auto max-w-4xl">
+            {file && (
+              <div className="mb-2 flex items-center gap-3 rounded-2xl border border-sky-100 bg-white px-4 py-2.5 shadow-sm">
+                <span className="text-2xl">{getFileIcon(file.name)}</span>
+                <div className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-semibold text-slate-700">{file.name}</span>
+                  <span className="text-xs text-slate-400">{(file.size / 1024).toFixed(0)} KB</span>
+                </div>
+                <button
+                  onClick={() => {
+                    setFile(null);
+                    if (fileInputRef.current) fileInputRef.current.value = "";
+                  }}
+                  className="rounded-full px-2 py-1 text-slate-400 hover:bg-red-50 hover:text-red-500"
+                  aria-label="Hapus lampiran"
+                >
+                  ×
+                </button>
+              </div>
+            )}
+
+            <div className="flex items-end gap-2 rounded-3xl border border-sky-200 bg-white px-3 py-2 shadow-[0_8px_30px_-10px_rgba(114,196,238,0.2)] transition focus-within:border-sky-400 focus-within:shadow-sky-100 sm:gap-3 sm:px-4">
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={Boolean(loadingChatId)}
+                className="mb-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-sky-50 text-sky-500 transition hover:bg-sky-100 disabled:opacity-50"
+                title="Unggah gambar atau PDF"
+                aria-label="Unggah file"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                </svg>
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".jpg,.jpeg,.png,.gif,.webp,.pdf"
+                onChange={handleFileSelect}
+                className="hidden"
+              />
+              <textarea
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Type your message here..."
+                rows={1}
+                disabled={Boolean(loadingChatId)}
+                className="mb-0.5 max-h-32 min-h-10 flex-1 resize-y bg-transparent py-2.5 text-[15px] leading-5 text-slate-800 outline-none placeholder:text-slate-400 disabled:opacity-60"
+              />
+              <button
+                onClick={() => void handleSend()}
+                disabled={Boolean(loadingChatId) || (!input.trim() && !file)}
+                className="mb-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-sky-500 to-blue-500 text-white shadow-md shadow-sky-200 transition hover:scale-105 disabled:scale-100 disabled:opacity-40 disabled:shadow-none"
+                aria-label="Kirim pesan"
+              >
+                <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="ml-0.5">
+                  <path d="m22 2-7 20-4-9-9-4Z" />
+                  <path d="M22 2 11 13" />
+                </svg>
+              </button>
+            </div>
+            <p className="mt-2 text-center text-[11px] text-slate-400">
+              Enter untuk mengirim · Shift+Enter untuk baris baru
+            </p>
+          </div>
+        </div>
+      </section>
     </div>
   );
 }
